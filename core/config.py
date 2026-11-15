@@ -16,6 +16,7 @@ from auth.oauth_config import (
     set_transport_mode,
     get_transport_mode,
     is_oauth21_enabled,
+    get_service_account_email,
 )
 
 # Server configuration. WORKSPACE_MCP_PORT is resolved lazily via PEP 562
@@ -39,9 +40,12 @@ def __getattr__(name: str) -> int:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# Disable USER_GOOGLE_EMAIL in OAuth 2.1 multi-user mode
+# Disable USER_GOOGLE_EMAIL in OAuth 2.1 multi-user mode. A service account acting
+# as itself (no delegation) is always its own client_email.
 USER_GOOGLE_EMAIL = (
-    None if is_oauth21_enabled() else os.getenv("USER_GOOGLE_EMAIL", None)
+    None
+    if is_oauth21_enabled()
+    else get_service_account_email() or os.getenv("USER_GOOGLE_EMAIL", None)
 )
 
 # Re-export OAuth functions for backward compatibility

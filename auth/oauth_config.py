@@ -8,6 +8,7 @@ sensible defaults for all OAuth-related settings.
 Supports both OAuth 2.0 and OAuth 2.1 with automatic client capability detection.
 """
 
+import json
 import logging
 import os
 from ipaddress import ip_address
@@ -222,10 +223,6 @@ class OAuthConfig:
         self.stateless_mode = (
             os.getenv("WORKSPACE_MCP_STATELESS_MODE", "false").lower() == "true"
         )
-        if self.stateless_mode and not self.oauth21_enabled:
-            raise ValueError(
-                "WORKSPACE_MCP_STATELESS_MODE requires MCP_ENABLE_OAUTH21=true"
-            )
 
         # Service account (domain-wide delegation) configuration
         self.service_account_key_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY_FILE")
@@ -245,6 +242,52 @@ class OAuthConfig:
                 "Set GOOGLE_SERVICE_ACCOUNT_KEY_FILE or GOOGLE_SERVICE_ACCOUNT_KEY_JSON, "
                 "but not MCP_ENABLE_OAUTH21=true."
             )
+
+        # Stateless mode needs either OAuth 2.1 (tokens live in the session) or
+        # service account mode (credentials are minted from the key per request).
+        # Either way nothing is written to the local credential store.
+        if (
+            self.stateless_mode
+            and not self.oauth21_enabled
+            and not self.service_account_enabled
+        ):
+            raise ValueError(
+                "WORKSPACE_MCP_STATELESS_MODE requires MCP_ENABLE_OAUTH21=true "
+                "or service account mode."
+            )
+
+        # Service account acting as itself (no domain-wide delegation). For
+        # deployments without Google Workspace (e.g. consumer Gmail accounts), where
+        # DWD is impossible: the server authenticates as the service account's own
+        # identity and can reach only what has been shared with its client_email.
+        self.service_account_no_delegation = (
+            os.getenv("GOOGLE_SERVICE_ACCOUNT_NO_DELEGATION", "false").lower() == "true"
+        )
+        self.service_account_email: Optional[str] = None
+        if self.service_account_no_delegation:
+            if not self.service_account_enabled:
+                raise ValueError(
+                    "GOOGLE_SERVICE_ACCOUNT_NO_DELEGATION=true requires "
+                    "GOOGLE_SERVICE_ACCOUNT_KEY_FILE or GOOGLE_SERVICE_ACCOUNT_KEY_JSON."
+                )
+            if self.trust_gateway_identity:
+                raise ValueError(
+                    "GOOGLE_SERVICE_ACCOUNT_NO_DELEGATION=true is incompatible with "
+                    "TRUST_GATEWAY_IDENTITY=true: without delegation every request "
+                    "runs as the service account, so a gateway principal cannot "
+                    "select an identity."
+                )
+            self.service_account_email = self._read_service_account_email()
+            configured_user = os.getenv("USER_GOOGLE_EMAIL", "").strip()
+            if (
+                configured_user
+                and self.service_account_email
+                and configured_user.lower() != self.service_account_email.lower()
+            ):
+                raise ValueError(
+                    "USER_GOOGLE_EMAIL must be unset or equal to the service "
+                    "account's client_email when GOOGLE_SERVICE_ACCOUNT_NO_DELEGATION=true."
+                )
 
         # Optional per-request impersonation domain allowlist for service accounts.
         _raw_domains = os.getenv("DWD_ALLOWED_DOMAINS", "")
@@ -503,6 +546,23 @@ class OAuthConfig:
         """
         return self.service_account_enabled
 
+    def _read_service_account_email(self) -> Optional[str]:
+        """Return client_email from the configured key, or None if unreadable.
+
+        Errors are left for main.py's startup key validation to report clearly.
+        """
+        try:
+            if self.service_account_key_file:
+                with open(self.service_account_key_file) as f:
+                    info = json.load(f)
+            else:
+                info = json.loads(self.service_account_key_json or "")
+        except (OSError, ValueError) as e:
+            logger.error(f"Could not read client_email from service account key: {e}")
+            return None
+        email = info.get("client_email") if isinstance(info, dict) else None
+        return email.strip() if isinstance(email, str) and email.strip() else None
+
     def detect_oauth_version(self, request_params: Dict[str, Any]) -> str:
         """
         Detect OAuth version based on request parameters.
@@ -691,3 +751,15 @@ def is_trust_gateway_identity() -> bool:
 def is_service_account_enabled() -> bool:
     """Check if service account (domain-wide delegation) mode is enabled."""
     return get_oauth_config().is_service_account_enabled()
+
+
+def is_service_account_no_delegation() -> bool:
+    """Check if the service account acts as itself (no domain-wide delegation)."""
+    config = get_oauth_config()
+    return config.service_account_enabled and config.service_account_no_delegation
+
+
+def get_service_account_email() -> Optional[str]:
+    """The service account's client_email in no-delegation mode, else None."""
+    config = get_oauth_config()
+    return config.service_account_email if is_service_account_no_delegation() else None

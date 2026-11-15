@@ -34,11 +34,14 @@ from auth.oauth_config import (
     get_oauth_config,
     is_external_oauth21_provider,
     is_service_account_enabled,
+    is_service_account_no_delegation,
+    get_service_account_email,
     is_trust_gateway_identity,
 )
 from core.context import set_fastmcp_session_id
 from core.telemetry import record_authenticated_user, record_google_principal
 from auth.scopes import (
+    is_read_only_mode,
     GMAIL_READONLY_SCOPE,
     GMAIL_SEND_SCOPE,
     GMAIL_COMPOSE_SCOPE,
@@ -246,14 +249,15 @@ def _override_oauth21_user_email(
 
 
 def _get_service_account_credentials(
-    scopes: List[str], subject: str
+    scopes: List[str], subject: Optional[str]
 ) -> google_service_account.Credentials:
     """
-    Build service account credentials for domain-wide delegation.
+    Build service account credentials.
 
     Args:
         scopes: OAuth scopes to request
-        subject: Email of the domain user to impersonate
+        subject: Email of the domain user to impersonate via domain-wide
+            delegation, or None for the service account to act as itself
 
     Returns:
         google.oauth2.service_account.Credentials instance
@@ -307,23 +311,32 @@ def _validate_dwd_domain(email: str, config) -> None:
 
 def _widen_drive_scope_for_dwd(scopes: List[str], tool_name: str) -> List[str]:
     """
-    Substitute the full Drive scope for drive.file in service-account mode.
+    Substitute a broader Drive scope for drive.file in service-account mode.
 
     drive.file grants access only to files the app created or the user picked
-    through the Drive file picker. A domain-wide-delegation service account never
-    goes through a picker, so under drive.file every Drive write tool gets a bare
-    404 on any pre-existing file. The delegated token carries exactly the scopes
-    requested here, so SCOPE_HIERARCHY never applies, and the effective privilege
-    is governed by the Admin console's DWD scope allowlist regardless.
+    through the Drive file picker. A service account never goes through a picker,
+    so under drive.file every Drive write tool gets a bare 404 on any pre-existing
+    file. The token carries exactly the scopes requested here, so SCOPE_HIERARCHY
+    never applies. The effective privilege is governed by the Admin console's DWD
+    scope allowlist (with delegation) or by what is shared with the service
+    account (without delegation).
+
+    In read-only mode the substitute is drive.readonly, so a service-account token
+    never carries write access to Drive there.
     """
     if DRIVE_FILE_SCOPE not in scopes:
         return scopes
 
-    widened = [DRIVE_SCOPE if s == DRIVE_FILE_SCOPE else s for s in scopes]
+    substitute = DRIVE_READONLY_SCOPE if is_read_only_mode() else DRIVE_SCOPE
+    widened = []
+    for s in scopes:
+        s = substitute if s == DRIVE_FILE_SCOPE else s
+        if s not in widened:
+            widened.append(s)
     logger.debug(
-        f"[{tool_name}] Service-account mode: requesting {DRIVE_SCOPE} in place of "
-        f"{DRIVE_FILE_SCOPE}, which cannot reach pre-existing files under "
-        "domain-wide delegation. Authorize it in the Admin console DWD scope list."
+        f"[{tool_name}] Service-account mode: requesting {substitute} in place of "
+        f"{DRIVE_FILE_SCOPE}, which cannot reach pre-existing files without the "
+        "Drive file picker."
     )
     return widened
 
@@ -344,6 +357,32 @@ async def _authenticate_service(
     Returns:
         Tuple of (service, actual_user_email)
     """
+    if is_service_account_no_delegation():
+        sa_email = get_service_account_email()
+        if not sa_email:
+            raise GoogleAuthenticationError(
+                "GOOGLE_SERVICE_ACCOUNT_NO_DELEGATION=true but the service account "
+                "key has no readable client_email."
+            )
+        # Without delegation every request runs as the service account. Reject a
+        # different requested identity instead of silently reading as the robot.
+        if user_google_email and user_google_email.strip().lower() != sa_email.lower():
+            raise GoogleAuthenticationError(
+                f"This server acts as the service account {sa_email} without "
+                f"delegation and cannot act as {user_google_email}. Pass "
+                f"user_google_email='{sa_email}' or omit it."
+            )
+        credentials = _get_service_account_credentials(
+            _widen_drive_scope_for_dwd(resolved_scopes, tool_name), None
+        )
+        service = build_google_service(service_name, service_version, credentials)
+        logger.info(
+            f"[{tool_name}] Authenticated {service_name} as service account "
+            f"{sa_email} (no delegation)"
+        )
+        record_google_principal("service-account", sa_email)
+        return service, sa_email
+
     if is_service_account_enabled():
         canonical_email = _get_configured_user_google_email()
         if not canonical_email:
