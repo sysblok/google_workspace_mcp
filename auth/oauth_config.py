@@ -222,10 +222,6 @@ class OAuthConfig:
         self.stateless_mode = (
             os.getenv("WORKSPACE_MCP_STATELESS_MODE", "false").lower() == "true"
         )
-        if self.stateless_mode and not self.oauth21_enabled:
-            raise ValueError(
-                "WORKSPACE_MCP_STATELESS_MODE requires MCP_ENABLE_OAUTH21=true"
-            )
 
         # Service account (domain-wide delegation) configuration
         self.service_account_key_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY_FILE")
@@ -244,6 +240,19 @@ class OAuthConfig:
                 "Service account mode is incompatible with OAuth 2.1 mode. "
                 "Set GOOGLE_SERVICE_ACCOUNT_KEY_FILE or GOOGLE_SERVICE_ACCOUNT_KEY_JSON, "
                 "but not MCP_ENABLE_OAUTH21=true."
+            )
+
+        # Stateless mode needs either OAuth 2.1 (tokens live in the session) or
+        # service account mode (credentials are minted from the key per request).
+        # Either way nothing is written to the local credential store.
+        if (
+            self.stateless_mode
+            and not self.oauth21_enabled
+            and not self.service_account_enabled
+        ):
+            raise ValueError(
+                "WORKSPACE_MCP_STATELESS_MODE requires MCP_ENABLE_OAUTH21=true "
+                "or service account mode."
             )
 
         # Optional per-request impersonation domain allowlist for service accounts.
